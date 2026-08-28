@@ -86,7 +86,9 @@ human decides.
 
 Copy `ci/` and `.github/workflows/playbook-ci.yml` into your playbook repo.
 
-1. Set `ANTHROPIC_API_KEY` as a repository secret
+1. Set `ANTHROPIC_API_KEY` as a repository secret. If it is an **identity-linked** key,
+   also set `ANTHROPIC_WORKSPACE_ID` — without it every request returns
+   `anthropic-workspace-id is required`. A workspace-scoped key needs no such header.
 2. Set `SOAR_REPO_PREFIX` in the workflow to your shared repo name (default `soar-content`)
 3. Make **validate-playbooks** a required status check in branch protection. Leave
    **scan-secrets** out of the required set.

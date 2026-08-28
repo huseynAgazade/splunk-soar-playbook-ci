@@ -61,6 +61,7 @@ scan-secrets:
     GIT_SSL_NO_VERIFY: "true"
     CLAUDE_MODEL: "claude-opus-5"
     # ANTHROPIC_API_KEY is provided as a masked CI/CD variable in project settings.
+    # ANTHROPIC_WORKSPACE_ID is only needed for an identity-linked key.
   script:
     - python --version
     - pip install -r ci/requirements.txt
