@@ -70,6 +70,10 @@ That last one matters. An AI check that silently passes when it could not run is
 do not have — so a missing key, an exhausted rate limit and a safety decline all fail loudly
 rather than reporting a clean file.
 
+The jobs run in order, not in parallel: `scan-secrets` declares `needs: validate-playbooks`,
+so a pull request that fails structure validation is never sent to the API. It cannot merge
+anyway, and the scan is the part that costs money.
+
 ## Why the split
 
 Structure validation is **blocking** and cannot be overridden — those rules are objective

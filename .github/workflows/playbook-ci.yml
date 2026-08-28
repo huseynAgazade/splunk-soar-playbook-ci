@@ -55,6 +55,9 @@ jobs:
   # Set ANTHROPIC_API_KEY as a repository secret.
   # -------------------------------------------------------------------------
   scan-secrets:
+    # Structure first. A pull request that cannot merge is not worth paying to
+    # scan, so this is skipped entirely when validation fails.
+    needs: validate-playbooks
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:

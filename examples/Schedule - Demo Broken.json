@@ -1,9 +1,0 @@
-{
-  "coa": {
-    "playbook_type": "automation",
-    "data": {
-      "description": "Playbook that violates the CI rules on purpose.",
-      "customCode": "phantom.debug('playbook level custom code is not allowed')"
-    }
-  }
-}

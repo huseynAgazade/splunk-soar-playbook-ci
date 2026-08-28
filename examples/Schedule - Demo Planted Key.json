@@ -1,0 +1,9 @@
+{
+  "coa": {
+    "playbook_type": "automation",
+    "data": {
+      "description": "This playbook is structurally valid and carries a planted credential.",
+      "customCode": ""
+    }
+  }
+}
