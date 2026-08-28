@@ -1,0 +1,34 @@
+{
+  "coa": {
+    "playbook_type": "automation",
+    "data": {
+      "description": "This playbook is full of identifier-shaped strings and contains no credentials.",
+      "customCode": "",
+      "nodes": [
+        {
+          "id": "0",
+          "type": "start",
+          "customName": "start",
+          "conditionKey": "condition_key_f82a1f36-2b25-4427-a1a8-57fc55ea5b47"
+        },
+        {
+          "id": "1",
+          "type": "utility",
+          "customName": "Collect Indicators",
+          "customNameId": "collect_indicators_9c4e1a77b2d34f6081ab5e2c7d90f318",
+          "comparisonKey": "comparison_key_0a9d77e1-4c3b-41aa-9f2e-6b1d84c5e903",
+          "cefKey": "sourceAddress"
+        }
+      ],
+      "edges": [
+        {
+          "id": "e0",
+          "sourceId": "0",
+          "targetId": "1",
+          "sourceKey": "out",
+          "targetKey": "in"
+        }
+      ]
+    }
+  }
+}
