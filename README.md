@@ -1,15 +1,72 @@
 # SOAR Playbook CI
 
-CI for a Splunk SOAR playbook repository: **structural validation** of every changed
-playbook, and a **two-layer credential scan** that pairs deterministic regex rules with a
-local LLM. Ships as both a GitHub Actions workflow and a GitLab CI pipeline.
+Structure validation and credential scanning for a SOAR playbook repository, on
+every pull request. Ships as a GitHub Actions workflow and a GitLab CI pipeline.
+
+![License](https://img.shields.io/badge/license-MIT-blue) ![Python](https://img.shields.io/badge/python-3.13-blue)
 
 SOAR exports each playbook as a `.py` and a `.json`. Once a repo holds a few hundred of
-them, the things that go wrong are boring and repetitive — a block still called `code_1`,
-a custom function referencing the wrong repo, a description that does not match the
-playbook type, a `.json` whose `.py` never got committed, a token pasted into a code block
-during debugging and forgotten. None of that is caught by the platform, and all of it is
-cheap to catch in a pull request.
+them, the things that go wrong are boring and repetitive — a block still called `code_1`, a
+custom function pointing at the wrong repo, a description that does not match the playbook
+type, a `.json` whose `.py` never got committed, a token pasted into a code block during
+debugging and forgotten. The platform catches none of it, and all of it is cheap to catch in
+a pull request.
+
+## What a run looks like
+
+Structure first. This is the real output from the fixtures in `examples/`:
+
+```
+Playbook validation passed (4 file(s) checked).
+```
+
+Then the credential scan, on a playbook carrying fabricated secrets:
+
+```
+Regex/entropy layer findings:
+  x Demo Secret Shapes.py:9:  possible AWS access key id
+  x Demo Secret Shapes.py:10: possible Slack token
+  x Demo Secret Shapes.py:12: possible Bearer token literal
+  x Demo Secret Shapes.json:19: possible Hardcoded secret
+
+AI layer findings:
+  x Demo Secret Shapes.py:9:  AI: Hardcoded AWS access key ID literal
+  x Demo Secret Shapes.py:10: AI: Hardcoded Slack bot/webhook token literal
+  x Demo Secret Shapes.py:11: AI: Hardcoded service password literal
+  x Demo Secret Shapes.py:12: AI: Hardcoded bearer token literal
+  x Demo Secret Shapes.py:13: AI: Hardcoded JWT session token assembled from string literals
+  x Demo Secret Shapes.json:19: AI: Hardcoded API key literal in node config
+```
+
+Two of those the regex layer cannot reach. Line 11 is a constant named
+`SERVICE_PASSWORD` — underscore is a word character, so `\bpassword\b` never matches it,
+and `DB_PASSWORD` slips through the same way. Line 13 is a JWT concatenated across four
+source lines, so no single line contains one.
+
+And on a playbook stuffed with condition keys, comparison keys, a channel id, a commit
+hash, a SHA-256 digest, a UUID and a base64 blob — **both layers report nothing.** That is
+the result that decides whether anyone leaves the scan switched on.
+
+## Quick start
+
+Copy `ci/` and `.github/workflows/playbook-ci.yml` into your playbook repo:
+
+```sh
+git clone --depth 1 https://github.com/huseynAgazade/soar-playbook-ci /tmp/tpl
+cp -r /tmp/tpl/ci /tmp/tpl/.github .
+git add ci .github && git commit -m "Add playbook CI" && git push
+```
+
+Then:
+
+1. Add `ANTHROPIC_API_KEY` as a repository secret. Scope the key to **one workspace** — an
+   "all workspaces" key is identity-linked and every request will return
+   `anthropic-workspace-id is required` unless you also set `ANTHROPIC_WORKSPACE_ID`.
+2. Set `SOAR_REPO_PREFIX` in the workflow to your shared repo name (default `soar-content`).
+3. Make **validate-playbooks** a required status check in branch protection. Leave
+   **scan-secrets** out of the required set.
+
+Both jobs run on hosted runners; nothing needs to reach your network.
 
 ## What it checks
 
@@ -26,24 +83,27 @@ cheap to catch in a pull request.
 | `coa.data.customCode` is empty | playbook-level custom code hides logic outside the visual editor |
 | every changed `.py` has a `.json` in the repo, and vice versa | catches an orphaned half of an export |
 
-The counterpart does **not** have to change in the same PR — it only has to exist. That
-avoids forcing both files to be touched for a one-line edit.
+The counterpart does **not** have to change in the same pull request — it only has to exist.
+That avoids forcing both files to be touched for a one-line edit.
 
 ### Credentials — advisory
 
-**Layer 1, deterministic.** Regex rules for private keys, AWS keys, Slack and GitHub and
-GitLab tokens, Google API keys, JWTs, bearer literals, and labelled password/secret
-assignments — plus a Shannon-entropy check on quoted values, but *only* on lines that also
-carry a real secret keyword.
+**Layer 1, deterministic.** Regex rules for private keys, AWS keys, Slack, GitHub and GitLab
+tokens, Google API keys, JWTs, bearer literals, and labelled password/secret assignments,
+plus a Shannon-entropy check on quoted values — but only on lines that also carry a real
+secret keyword.
 
 **Layer 2, Claude.** Each changed file goes to the [Messages API](https://docs.claude.com/en/api/messages)
 line-numbered, with a system prompt that asks one question. The answer is constrained by
 `output_config.format` to a JSON schema, so there is no JSON repair, no markdown fences to
 strip and no retry-on-unparseable loop — the response either validates or the request failed.
 
-The interesting part of both layers is the false positives. A SOAR playbook JSON is full of
-things that look exactly like secrets and are not: `condition_key_f82a1f36-…`,
-`comparison_key`, node ids, hashes, Mattermost `channel_id` values. So:
+### The false positives are the hard part
+
+A SOAR playbook JSON is full of things that look exactly like secrets and are not:
+`condition_key_f82a1f36-…`, `comparisonKey`, node ids, `customNameId` hex blobs, commit
+hashes, Mattermost channel ids. A scanner that flags those is a scanner someone will switch
+off within a week. So:
 
 - the entropy trigger deliberately excludes a bare `key`, because `condition_key` is an
   identifier
@@ -67,44 +127,47 @@ found is worse than no scan at all.
 | `2` | the AI layer could not run — no API key, unreachable, rate limited past retries, or the request was declined |
 
 That last one matters. An AI check that silently passes when it could not run is a check you
-do not have — so a missing key, an exhausted rate limit and a safety decline all fail loudly
-rather than reporting a clean file.
-
-The jobs run in order, not in parallel: `scan-secrets` declares `needs: validate-playbooks`,
-so a pull request that fails structure validation is never sent to the API. It cannot merge
-anyway, and the scan is the part that costs money.
+do not have, so a missing key, an exhausted rate limit and a safety decline all fail loudly
+rather than reporting a clean file. The first such failure stops further API calls — the next
+file would hit it identically — while the regex layer finishes the run.
 
 ## Why the split
 
-Structure validation is **blocking** and cannot be overridden — those rules are objective
-and a violation is always wrong.
+Structure validation is **blocking** and cannot be overridden. Those rules are objective and
+a violation is always wrong.
 
 The credential scan is **advisory** (`continue-on-error` / `allow_failure`), because a
 heuristic scanner that can hard-block a merge eventually blocks a correct one, and the fix
 becomes "disable the scan". Pair it with required review and manual merge instead, so a
 human decides.
 
-## Setup
+The jobs run in order, not in parallel: `scan-secrets` declares `needs: validate-playbooks`,
+so a pull request that fails structure validation is never sent to the API. It cannot merge
+anyway, and the scan is the part that costs money.
 
-### GitHub Actions
+## Cost and model
 
-Copy `ci/` and `.github/workflows/playbook-ci.yml` into your playbook repo.
+The scan defaults to `claude-opus-5`; override with `CLAUDE_MODEL`. It is a bounded
+classification, so a smaller model may well be enough for your repo.
 
-1. Set `ANTHROPIC_API_KEY` as a repository secret. If it is an **identity-linked** key,
-   also set `ANTHROPIC_WORKSPACE_ID` — without it every request returns
-   `anthropic-workspace-id is required`. A workspace-scoped key needs no such header.
-2. Set `SOAR_REPO_PREFIX` in the workflow to your shared repo name (default `soar-content`)
-3. Make **validate-playbooks** a required status check in branch protection. Leave
-   **scan-secrets** out of the required set.
+- **Whole files are sent, never truncated.** An exported playbook `.json` can be 100 KB and
+  you pay input tokens for all of it. Check it against your own numbers rather than assuming
+  it is free.
+- **Only changed files are scanned.** Both pipelines diff against the merge base first, so
+  cost scales with the size of the pull request, not the size of the repo.
 
-Both jobs run on hosted runners; nothing needs to reach your network.
+Server-side refusal fallbacks are on by default, so a safety decline on a file full of
+credential-shaped strings re-runs on a fallback model inside the same call instead of ending
+the scan. Set `ENABLE_REFUSAL_FALLBACK = False` in `ci/scan_secrets.py` if your account has
+not enabled that beta.
 
-### GitLab CI
+## GitLab CI
 
 `.gitlab-ci.yml` is the original pipeline, kept in step with the Actions version. Add
-`ANTHROPIC_API_KEY` as a masked CI/CD variable and register a runner tagged `soar`.
+`ANTHROPIC_API_KEY` as a masked CI/CD variable and register a runner tagged `soar`. GitLab
+stages are sequential, so the scan already waits for validation there.
 
-### Locally
+## Running it locally
 
 ```sh
 python ci/validate_playbooks.py "Some Playbook.py" "Some Playbook.json"
@@ -113,31 +176,10 @@ pip install -r ci/requirements.txt
 ANTHROPIC_API_KEY=sk-ant-... python ci/scan_secrets.py "Some Playbook.py"
 ```
 
-Both take a file list, so anything that produces one — `git diff --name-only`, a
-pre-commit hook — can drive them.
-
-## Cost and model
-
-The scan defaults to `claude-opus-5`. Override with the `CLAUDE_MODEL` env var if you want
-a cheaper or faster model for this route — it is a bounded classification, so a smaller
-model may well be enough for your repo.
-
-Two things worth knowing before you turn it on for a large repo:
-
-- **Whole files are sent, never truncated.** An exported playbook `.json` can be 100 KB, and
-  you pay input tokens for all of it. A pull request touching ten large playbooks is a real,
-  if small, line item — check it against your own numbers rather than assuming it is free.
-- **Only changed files are scanned.** Both pipelines diff against the merge base first, so
-  the cost scales with the size of the pull request, not the size of the repo.
-
-Server-side refusal fallbacks are enabled by default, so a safety decline on a file full of
-credential-shaped strings re-runs on a fallback model inside the same call instead of ending
-the scan. Set `ENABLE_REFUSAL_FALLBACK = False` in `ci/scan_secrets.py` if your account has
-not enabled that beta.
+Both take a file list, so anything that produces one — `git diff --name-only`, a pre-commit
+hook — can drive them.
 
 ## Adapting the rules
-
-Every structural rule lives in `ci/validators/`, one module per file type:
 
 ```
 ci/validators/python_rules.py    AST walk over the exported .py
@@ -145,8 +187,12 @@ ci/validators/json_rules.py      description prefix, customCode
 ci/validators/pairing.py         .py / .json counterpart
 ```
 
-They are short and independent. The naming conventions encoded here are the ones I use;
-rewrite them to yours rather than adopting mine.
+Short and independent. The conventions encoded here are the ones I use; rewrite them to
+yours rather than adopting mine.
+
+`examples/` holds four fixture pairs used to exercise the pipeline. **Every
+credential-shaped string in them is fabricated and authenticates nowhere** — they exist so
+the scanner has something to find and so its false positives are visible.
 
 ## License
 
