@@ -44,9 +44,10 @@ validate-playbooks:
       echo "${CHANGED}" | xargs -d '\n' python ci/validate_playbooks.py
 
 # ---------------------------------------------------------------------------
-# Secret scan (regex + AI): ADVISORY. allow_failure lets an approver merge past
-# it. Human-in-the-loop = required approval + manual merge in project settings.
-# AI failure is a hard error inside the script (exit 2) -> job shows failed.
+# Secret scan (regex + Claude): ADVISORY. allow_failure lets an approver merge
+# past it. Human-in-the-loop = required approval + manual merge in project
+# settings. An AI layer that could not run is a hard error inside the script
+# (exit 2) -> job shows failed.
 # ---------------------------------------------------------------------------
 scan-secrets:
   stage: scan
@@ -58,11 +59,11 @@ scan-secrets:
   variables:
     GIT_DEPTH: "0"
     GIT_SSL_NO_VERIFY: "true"
-    OLLAMA_MODEL: "gpt-oss:20b"
-    # OLLAMA_URL is provided as a masked CI/CD variable in project settings,
-    # e.g. http://ollama.internal:11434
+    CLAUDE_MODEL: "claude-opus-5"
+    # ANTHROPIC_API_KEY is provided as a masked CI/CD variable in project settings.
   script:
     - python --version
+    - pip install -r ci/requirements.txt
     - |
       set -e
       TARGET_BRANCH="${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"

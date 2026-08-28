@@ -3,20 +3,20 @@
 
 Layer 1 (deterministic): regex + high-entropy detection for obvious secrets
     (API keys, tokens, passwords, private keys).
-Layer 2 (AI): sends each changed file to a local Ollama model and asks whether
-    it contains hardcoded credentials.
+Layer 2 (AI): sends each changed file to Claude and asks whether it contains
+    hardcoded credentials, with the answer constrained to a JSON schema.
 
 Exit codes:
     0  no secrets found by either layer
     1  a secret was found (regex and/or AI)
-    2  AI layer failed to run (network/parse/timeout) -> HARD FAIL by request
+    2  AI layer could not run (no API key, unreachable, refused) -> HARD FAIL
 
 Usage:
     scan_secrets.py <file> [<file> ...]
 
 Environment:
-    OLLAMA_URL   base URL of the Ollama server, e.g. http://ollama.internal:11434
-    OLLAMA_MODEL model tag (default: qwen3.5:9b)
+    ANTHROPIC_API_KEY  required
+    CLAUDE_MODEL       model id (default: claude-opus-5)
 """
 from __future__ import annotations
 
@@ -25,12 +25,20 @@ import math
 import os
 import re
 import sys
-import urllib.request
-import urllib.error
 from pathlib import Path
 
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.5:9b")
-OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "120"))
+try:
+    import anthropic
+except ImportError:  # pragma: no cover - surfaced at runtime with a clear message
+    anthropic = None
+
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5")
+CLAUDE_TIMEOUT = float(os.environ.get("CLAUDE_TIMEOUT", "300"))
+
+# A safety decline on a file full of credential-shaped strings would otherwise
+# end the scan. Server-side fallbacks re-run the request on a fallback model
+# inside the same call. Set to False if your account has not enabled the beta.
+ENABLE_REFUSAL_FALLBACK = True
 
 # ---------------------------------------------------------------------------
 # Layer 1: deterministic regex / entropy rules
@@ -133,7 +141,7 @@ def regex_scan(path: str, text: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Layer 2: Ollama AI check
+# Layer 2: Claude
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = (
@@ -148,12 +156,31 @@ SYSTEM_PROMPT = (
     "secret VALUES count. For example, a Mattermost 'channel_id' value like "
     "'abc123def456ghi789jkl012mn' is an identifier, NOT a credential; do not "
     "flag it.\n"
-    "Do not think or explain. Never include the secret value itself in your "
-    "reason; describe only its type. Respond with STRICT JSON only, no markdown. "
-    "Schema:\n"
-    '{"has_credentials": true|false, '
-    '"findings": [{"line": <int>, "reason": "<secret type, no value>"}]}'
+    "Never include the secret value itself in a reason; describe only its type, "
+    "for example 'hardcoded API key' or 'private key block'."
 )
+
+# The response is constrained to this schema, so no JSON repair is needed.
+FINDINGS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "has_credentials": {"type": "boolean"},
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "line": {"type": "integer"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["line", "reason"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["has_credentials", "findings"],
+    "additionalProperties": False,
+}
 
 
 def _number_lines(text: str) -> str:
@@ -176,92 +203,82 @@ def _sanitize_reason(reason: str) -> str:
     return s[:120] if s else "credential"
 
 
-def _extract_json(s: str) -> dict | None:
-    """Pull the first {...} JSON object out of a model response."""
-    # Strip common thinking/markdown wrappers.
-    s = re.sub(r"<think>.*?</think>", "", s, flags=re.DOTALL)
-    s = s.strip()
-    # Find the first balanced-looking JSON object.
-    start = s.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    for i in range(start, len(s)):
-        if s[i] == "{":
-            depth += 1
-        elif s[i] == "}":
-            depth -= 1
-            if depth == 0:
-                candidate = s[start:i + 1]
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError:
-                    return None
-    return None
+class ClaudeUnavailableError(RuntimeError):
+    """The API could not be reached, or refused to answer (hard fail)."""
 
 
-class OllamaConnectionError(RuntimeError):
-    """The Ollama server could not be reached (real infrastructure failure)."""
+class ClaudeParseError(RuntimeError):
+    """The response could not be turned into findings (advisory)."""
 
 
-class OllamaParseError(RuntimeError):
-    """The model responded but its output could not be parsed as valid JSON."""
+def build_client() -> "anthropic.Anthropic":
+    if anthropic is None:
+        raise ClaudeUnavailableError(
+            "the 'anthropic' package is not installed (pip install anthropic)")
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        raise ClaudeUnavailableError("ANTHROPIC_API_KEY is not set")
+    return anthropic.Anthropic(timeout=CLAUDE_TIMEOUT)
 
 
-def ollama_scan(path: str, text: str, base_url: str) -> tuple[bool, list[str]]:
+def claude_scan(path: str, text: str, client) -> tuple[bool, list[str]]:
     """Return (has_credentials, findings).
 
-    Raises OllamaConnectionError if the server is unreachable, or
-    OllamaParseError if the model's response can't be parsed. Retries a parse
-    failure once before giving up.
+    Raises ClaudeUnavailableError for an infrastructure or auth failure, and
+    ClaudeParseError when the model answered but the answer was unusable.
     """
-    url = base_url.rstrip("/") + "/api/chat"
-    numbered = _number_lines(text)
-    payload = {
-        "model": OLLAMA_MODEL,
-        "stream": False,
-        "think": False,  # disable thinking -> faster, fewer stray tokens
-        "format": "json",  # ask Ollama to constrain output to valid JSON
-        "options": {
-            "temperature": 0,
-            "num_predict": 512,  # cap generation; the JSON answer is small
-        },
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"FILE: {path}\n\n{numbered}"},
-        ],
+    request = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": 4096,
+        "system": SYSTEM_PROMPT,
+        "messages": [{"role": "user", "content": f"FILE: {path}\n\n{_number_lines(text)}"}],
+        "output_config": {"format": {"type": "json_schema", "schema": FINDINGS_SCHEMA}},
     }
-    data = json.dumps(payload).encode("utf-8")
 
-    last_parse_err: Exception | None = None
-    for attempt in (1, 2):  # one retry on parse failure
-        req = urllib.request.Request(
-            url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
-                body = resp.read().decode("utf-8")
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
-            raise OllamaConnectionError(f"Ollama unreachable for {path}: {e}") from e
+    try:
+        if ENABLE_REFUSAL_FALLBACK:
+            response = client.beta.messages.create(
+                betas=["server-side-fallback-2026-07-01"],
+                fallbacks="default",
+                **request,
+            )
+        else:
+            response = client.messages.create(**request)
+    except anthropic.AuthenticationError as e:
+        raise ClaudeUnavailableError(f"authentication failed: {e}") from e
+    except anthropic.PermissionDeniedError as e:
+        raise ClaudeUnavailableError(f"API key lacks permission: {e}") from e
+    except anthropic.NotFoundError as e:
+        raise ClaudeUnavailableError(f"unknown model '{CLAUDE_MODEL}': {e}") from e
+    except anthropic.RateLimitError as e:
+        raise ClaudeUnavailableError(f"rate limited after retries for {path}: {e}") from e
+    except anthropic.APITimeoutError as e:
+        raise ClaudeUnavailableError(f"timed out scanning {path}: {e}") from e
+    except anthropic.APIConnectionError as e:
+        raise ClaudeUnavailableError(f"could not reach the API for {path}: {e}") from e
+    except anthropic.APIStatusError as e:
+        if e.status_code >= 500:
+            raise ClaudeUnavailableError(f"server error {e.status_code} for {path}") from e
+        raise ClaudeUnavailableError(f"request rejected ({e.status_code}) for {path}: {e.message}") from e
 
-        try:
-            outer = json.loads(body)
-            content = outer["message"]["content"]
-        except (json.JSONDecodeError, KeyError) as e:
-            last_parse_err = e
-            continue
+    # A whole-chain refusal means this file was not analyzed. Do not call it clean.
+    if response.stop_reason == "refusal":
+        detail = getattr(response, "stop_details", None)
+        category = getattr(detail, "category", None) if detail else None
+        raise ClaudeUnavailableError(
+            f"the request for {path} was declined"
+            + (f" (category: {category})" if category else ""))
 
-        parsed = _extract_json(content)
-        if parsed is None or "has_credentials" not in parsed:
-            last_parse_err = ValueError("model JSON missing has_credentials")
-            continue
+    body = next((b.text for b in response.content if b.type == "text"), None)
+    if not body:
+        raise ClaudeParseError(f"empty response for {path}")
 
-        # Success.
-        return _build_findings(path, text, parsed)
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError as e:
+        raise ClaudeParseError(
+            f"unparseable response for {path} (content redacted): {e}") from e
 
-    # Both attempts failed to parse.
-    raise OllamaParseError(
-        f"Could not parse model JSON for {path} after retry "
-        f"(response redacted to avoid leaking secrets).")
+    return _build_findings(path, text, parsed)
 
 
 def _build_findings(path: str, text: str, parsed: dict) -> tuple[bool, list[str]]:
@@ -336,15 +353,16 @@ def main(argv: list[str]) -> int:
         print("No files to scan.")
         return 0
 
-    base_url = os.environ.get("OLLAMA_URL", "").strip()
-    if not base_url:
-        print("ERROR: OLLAMA_URL is not set; cannot run AI secret scan.", file=sys.stderr)
+    try:
+        client = build_client()
+    except ClaudeUnavailableError as e:
+        print(f"ERROR: cannot run AI secret scan: {e}", file=sys.stderr)
         return 2  # hard fail: AI layer unavailable
 
     regex_findings: list[str] = []
     ai_findings: list[str] = []
-    ai_unreachable = False   # connection failure -> hard fail
-    ai_parse_warnings: list[str] = []  # model returned junk -> warn only
+    ai_unavailable = False           # infrastructure/auth/refusal -> hard fail
+    ai_parse_warnings: list[str] = []  # unusable answer -> warn only
 
     for path in files:
         p = Path(path)
@@ -359,31 +377,31 @@ def main(argv: list[str]) -> int:
 
         # Layer 2
         try:
-            has, findings = ollama_scan(path, text, base_url)
+            has, findings = claude_scan(path, text, client)
             if has:
                 ai_findings.extend(findings or [f"{path}: AI flagged credentials"])
-        except OllamaConnectionError as e:
+        except ClaudeUnavailableError as e:
             print(f"  ! {e}", file=sys.stderr)
-            ai_unreachable = True
-        except OllamaParseError as e:
-            # Model responded but output was unusable. Do not hard-fail on this;
-            # the regex layer still ran. Warn so a human can eyeball the file.
+            ai_unavailable = True
+        except ClaudeParseError as e:
+            # The model answered but the answer was unusable. The regex layer
+            # still ran, so warn rather than block.
             print(f"  ~ {e}", file=sys.stderr)
-            ai_parse_warnings.append(f"{path}: AI could not analyze (unparseable response)")
+            ai_parse_warnings.append(f"{path}: AI could not analyze this file")
 
     print("=" * 50)
     if regex_findings:
         print("Regex/entropy layer findings:")
         for f in regex_findings:
-            print(f"  ✗ {f}")
+            print(f"  x {f}")
     else:
         print("Regex/entropy layer: clean.")
 
     if ai_findings:
         print("\nAI layer findings:")
         for f in ai_findings:
-            print(f"  ✗ {f}")
-    elif not ai_unreachable and not ai_parse_warnings:
+            print(f"  x {f}")
+    elif not ai_unavailable and not ai_parse_warnings:
         print("AI layer: clean.")
 
     if ai_parse_warnings:
@@ -392,17 +410,14 @@ def main(argv: list[str]) -> int:
             print(f"  ~ {w}")
     print("=" * 50)
 
-    # Decide exit code.
-    # Connection failure to Ollama is a real infra problem -> hard fail.
-    if ai_unreachable:
-        print("\nSecret scan FAILED: Ollama server unreachable (hard fail).")
+    # An AI layer that silently passes when it could not run is not a check.
+    if ai_unavailable:
+        print("\nSecret scan FAILED: the AI layer could not run (hard fail).")
         return 2
-    # Any actual finding (regex or AI) -> fail (advisory in CI via allow_failure).
     if regex_findings or ai_findings:
         n = len(regex_findings) + len(ai_findings)
         print(f"\nSecret scan FOUND {n} potential credential(s).")
         return 1
-    # Parse warnings alone do not fail the job.
     if ai_parse_warnings:
         print("\nSecret scan passed with warnings (some files not AI-analyzed).")
         return 0

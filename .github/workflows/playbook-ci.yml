@@ -52,11 +52,10 @@ jobs:
   # Secret scan (regex + AI): ADVISORY. continue-on-error lets a reviewer merge
   # past it. Keep it OUT of required checks and require a human approval instead.
   #
-  # Needs a runner that can reach your Ollama server, so this is self-hosted.
-  # Set OLLAMA_URL as a repository secret.
+  # Set ANTHROPIC_API_KEY as a repository secret.
   # -------------------------------------------------------------------------
   scan-secrets:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -67,12 +66,15 @@ jobs:
         with:
           python-version: '3.13'
 
+      - name: Install dependencies
+        run: pip install -r ci/requirements.txt
+
       - name: Scan changed playbooks for credentials
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          OLLAMA_URL: ${{ secrets.OLLAMA_URL }}
-          OLLAMA_MODEL: gpt-oss:20b
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_MODEL: claude-opus-5
         run: |
           set -e
           CHANGED=$(git diff --name-only --diff-filter=ACMR "$BASE_SHA" "$HEAD_SHA" \

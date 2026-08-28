@@ -36,8 +36,10 @@ GitLab tokens, Google API keys, JWTs, bearer literals, and labelled password/sec
 assignments — plus a Shannon-entropy check on quoted values, but *only* on lines that also
 carry a real secret keyword.
 
-**Layer 2, an LLM.** Each changed file goes to a local [Ollama](https://ollama.com) model,
-line-numbered, with a system prompt that asks one question and demands strict JSON back.
+**Layer 2, Claude.** Each changed file goes to the [Messages API](https://docs.claude.com/en/api/messages)
+line-numbered, with a system prompt that asks one question. The answer is constrained by
+`output_config.format` to a JSON schema, so there is no JSON repair, no markdown fences to
+strip and no retry-on-unparseable loop — the response either validates or the request failed.
 
 The interesting part of both layers is the false positives. A SOAR playbook JSON is full of
 things that look exactly like secrets and are not: `condition_key_f82a1f36-…`,
@@ -60,12 +62,13 @@ found is worse than no scan at all.
 
 | Code | Meaning |
 |---|---|
-| `0` | clean, or the AI layer returned unparseable output (warning only) |
+| `0` | clean, or the AI layer returned an unusable answer for some file (warning only) |
 | `1` | a credential was found by either layer |
-| `2` | the Ollama server was unreachable — a real infrastructure failure, not a pass |
+| `2` | the AI layer could not run — no API key, unreachable, rate limited past retries, or the request was declined |
 
-That last one matters. An AI check that silently passes when the model is down is a check
-you do not have.
+That last one matters. An AI check that silently passes when it could not run is a check you
+do not have — so a missing key, an exhausted rate limit and a safety decline all fail loudly
+rather than reporting a clean file.
 
 ## Why the split
 
@@ -83,27 +86,48 @@ human decides.
 
 Copy `ci/` and `.github/workflows/playbook-ci.yml` into your playbook repo.
 
-1. Set `OLLAMA_URL` as a repository secret, e.g. `http://ollama.internal:11434`
-2. The secret-scan job needs a runner that can reach it — hence `runs-on: self-hosted`.
-   Drop that job if you only want structure validation.
-3. Set `SOAR_REPO_PREFIX` in the workflow to your shared repo name (default `soar-content`)
-4. Make **validate-playbooks** a required status check in branch protection. Leave
+1. Set `ANTHROPIC_API_KEY` as a repository secret
+2. Set `SOAR_REPO_PREFIX` in the workflow to your shared repo name (default `soar-content`)
+3. Make **validate-playbooks** a required status check in branch protection. Leave
    **scan-secrets** out of the required set.
+
+Both jobs run on hosted runners; nothing needs to reach your network.
 
 ### GitLab CI
 
 `.gitlab-ci.yml` is the original pipeline, kept in step with the Actions version. Add
-`OLLAMA_URL` as a masked CI/CD variable and register a runner tagged `soar`.
+`ANTHROPIC_API_KEY` as a masked CI/CD variable and register a runner tagged `soar`.
 
 ### Locally
 
 ```sh
 python ci/validate_playbooks.py "Some Playbook.py" "Some Playbook.json"
-OLLAMA_URL=http://ollama.internal:11434 python ci/scan_secrets.py "Some Playbook.py"
+
+pip install -r ci/requirements.txt
+ANTHROPIC_API_KEY=sk-ant-... python ci/scan_secrets.py "Some Playbook.py"
 ```
 
 Both take a file list, so anything that produces one — `git diff --name-only`, a
 pre-commit hook — can drive them.
+
+## Cost and model
+
+The scan defaults to `claude-opus-5`. Override with the `CLAUDE_MODEL` env var if you want
+a cheaper or faster model for this route — it is a bounded classification, so a smaller
+model may well be enough for your repo.
+
+Two things worth knowing before you turn it on for a large repo:
+
+- **Whole files are sent, never truncated.** An exported playbook `.json` can be 100 KB, and
+  you pay input tokens for all of it. A pull request touching ten large playbooks is a real,
+  if small, line item — check it against your own numbers rather than assuming it is free.
+- **Only changed files are scanned.** Both pipelines diff against the merge base first, so
+  the cost scales with the size of the pull request, not the size of the repo.
+
+Server-side refusal fallbacks are enabled by default, so a safety decline on a file full of
+credential-shaped strings re-runs on a fallback model inside the same call instead of ending
+the scan. Set `ENABLE_REFUSAL_FALLBACK = False` in `ci/scan_secrets.py` if your account has
+not enabled that beta.
 
 ## Adapting the rules
 
