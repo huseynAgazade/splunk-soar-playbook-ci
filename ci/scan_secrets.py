@@ -15,8 +15,9 @@ Usage:
     scan_secrets.py <file> [<file> ...]
 
 Environment:
-    ANTHROPIC_API_KEY  required
-    CLAUDE_MODEL       model id (default: claude-opus-5)
+    ANTHROPIC_API_KEY      required
+    ANTHROPIC_WORKSPACE_ID  required only for an identity-linked key
+    CLAUDE_MODEL           model id (default: claude-opus-5)
 """
 from __future__ import annotations
 
@@ -217,7 +218,15 @@ def build_client() -> "anthropic.Anthropic":
             "the 'anthropic' package is not installed (pip install anthropic)")
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise ClaudeUnavailableError("ANTHROPIC_API_KEY is not set")
-    return anthropic.Anthropic(timeout=CLAUDE_TIMEOUT)
+
+    # An identity-linked API key must name the workspace it acts in. A plain
+    # workspace-scoped key does not, and ignores this.
+    headers = {}
+    workspace = os.environ.get("ANTHROPIC_WORKSPACE_ID", "").strip()
+    if workspace:
+        headers["anthropic-workspace-id"] = workspace
+
+    return anthropic.Anthropic(timeout=CLAUDE_TIMEOUT, default_headers=headers or None)
 
 
 def claude_scan(path: str, text: str, client) -> tuple[bool, list[str]]:
@@ -258,7 +267,13 @@ def claude_scan(path: str, text: str, client) -> tuple[bool, list[str]]:
     except anthropic.APIStatusError as e:
         if e.status_code >= 500:
             raise ClaudeUnavailableError(f"server error {e.status_code} for {path}") from e
-        raise ClaudeUnavailableError(f"request rejected ({e.status_code}) for {path}: {e.message}") from e
+        if "anthropic-workspace-id" in str(e):
+            raise ClaudeUnavailableError(
+                "this API key is identity-linked, so it must name a workspace. "
+                "Either set ANTHROPIC_WORKSPACE_ID, or issue a workspace-scoped "
+                "key and use that instead.") from e
+        raise ClaudeUnavailableError(
+            f"request rejected ({e.status_code}) for {path}: {e.message}") from e
 
     # A whole-chain refusal means this file was not analyzed. Do not call it clean.
     if response.stop_reason == "refusal":
@@ -375,19 +390,22 @@ def main(argv: list[str]) -> int:
         # Layer 1
         regex_findings.extend(regex_scan(path, text))
 
-        # Layer 2
-        try:
-            has, findings = claude_scan(path, text, client)
-            if has:
-                ai_findings.extend(findings or [f"{path}: AI flagged credentials"])
-        except ClaudeUnavailableError as e:
-            print(f"  ! {e}", file=sys.stderr)
-            ai_unavailable = True
-        except ClaudeParseError as e:
-            # The model answered but the answer was unusable. The regex layer
-            # still ran, so warn rather than block.
-            print(f"  ~ {e}", file=sys.stderr)
-            ai_parse_warnings.append(f"{path}: AI could not analyze this file")
+        # Layer 2. A failure here is a configuration or infrastructure problem
+        # that the next file will hit identically, so stop calling the API and
+        # let the regex layer finish the remaining files.
+        if not ai_unavailable:
+            try:
+                has, findings = claude_scan(path, text, client)
+                if has:
+                    ai_findings.extend(findings or [f"{path}: AI flagged credentials"])
+            except ClaudeUnavailableError as e:
+                print(f"  ! {e}", file=sys.stderr)
+                ai_unavailable = True
+            except ClaudeParseError as e:
+                # The model answered but the answer was unusable. The regex layer
+                # still ran, so warn rather than block.
+                print(f"  ~ {e}", file=sys.stderr)
+                ai_parse_warnings.append(f"{path}: AI could not analyze this file")
 
     print("=" * 50)
     if regex_findings:

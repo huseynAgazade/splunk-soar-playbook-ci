@@ -55,6 +55,9 @@ jobs:
   # Set ANTHROPIC_API_KEY as a repository secret.
   # -------------------------------------------------------------------------
   scan-secrets:
+    # Structure first. A pull request that cannot merge is not worth paying to
+    # scan, so this is skipped entirely when validation fails.
+    needs: validate-playbooks
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -74,6 +77,8 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Only needed for an identity-linked key; harmless when unset.
+          ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
           CLAUDE_MODEL: claude-opus-5
         run: |
           set -e

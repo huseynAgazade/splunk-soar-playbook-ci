@@ -70,6 +70,10 @@ That last one matters. An AI check that silently passes when it could not run is
 do not have — so a missing key, an exhausted rate limit and a safety decline all fail loudly
 rather than reporting a clean file.
 
+The jobs run in order, not in parallel: `scan-secrets` declares `needs: validate-playbooks`,
+so a pull request that fails structure validation is never sent to the API. It cannot merge
+anyway, and the scan is the part that costs money.
+
 ## Why the split
 
 Structure validation is **blocking** and cannot be overridden — those rules are objective
@@ -86,7 +90,9 @@ human decides.
 
 Copy `ci/` and `.github/workflows/playbook-ci.yml` into your playbook repo.
 
-1. Set `ANTHROPIC_API_KEY` as a repository secret
+1. Set `ANTHROPIC_API_KEY` as a repository secret. If it is an **identity-linked** key,
+   also set `ANTHROPIC_WORKSPACE_ID` — without it every request returns
+   `anthropic-workspace-id is required`. A workspace-scoped key needs no such header.
 2. Set `SOAR_REPO_PREFIX` in the workflow to your shared repo name (default `soar-content`)
 3. Make **validate-playbooks** a required status check in branch protection. Leave
    **scan-secrets** out of the required set.
