@@ -1,0 +1,9 @@
+{
+  "coa": {
+    "playbook_type": "automation",
+    "data": {
+      "description": "This playbook demonstrates a playbook that passes every CI rule.",
+      "customCode": ""
+    }
+  }
+}
