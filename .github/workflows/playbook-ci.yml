@@ -1,0 +1,88 @@
+name: Playbook CI
+
+# GitLab ran this only on the dev -> main merge request. The GitHub equivalent
+# is a pull request targeting main; narrow it further with `head_ref` below if
+# you want to mirror the single-branch rule exactly.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '**.py'
+      - '**.json'
+
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Structure validation: HARD REQUIRED. Make this a required status check in
+  # branch protection so it cannot be merged past.
+  # -------------------------------------------------------------------------
+  validate-playbooks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Validate changed playbooks
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SOAR_REPO_PREFIX: soar-content
+        run: |
+          set -e
+          CHANGED=$(git diff --name-only --diff-filter=ACMR "$BASE_SHA" "$HEAD_SHA" \
+            -- '*.py' '*.json' ':(exclude)ci/**' ':(exclude).github/**')
+          echo "----------------------------------------"
+          if [ -z "$CHANGED" ]; then
+            echo "No playbook .py/.json changes in this PR. Nothing to validate."
+            exit 0
+          fi
+          echo "Changed playbook files:"
+          echo "$CHANGED" | sed 's/^/  - /'
+          echo "----------------------------------------"
+          echo "$CHANGED" | xargs -d '\n' python ci/validate_playbooks.py --from-diff
+
+  # -------------------------------------------------------------------------
+  # Secret scan (regex + AI): ADVISORY. continue-on-error lets a reviewer merge
+  # past it. Keep it OUT of required checks and require a human approval instead.
+  #
+  # Needs a runner that can reach your Ollama server, so this is self-hosted.
+  # Set OLLAMA_URL as a repository secret.
+  # -------------------------------------------------------------------------
+  scan-secrets:
+    runs-on: self-hosted
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Scan changed playbooks for credentials
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          OLLAMA_URL: ${{ secrets.OLLAMA_URL }}
+          OLLAMA_MODEL: gpt-oss:20b
+        run: |
+          set -e
+          CHANGED=$(git diff --name-only --diff-filter=ACMR "$BASE_SHA" "$HEAD_SHA" \
+            -- '*.py' '*.json' ':(exclude)ci/**' ':(exclude).github/**')
+          echo "----------------------------------------"
+          if [ -z "$CHANGED" ]; then
+            echo "No playbook .py/.json changes in this PR. Nothing to scan."
+            exit 0
+          fi
+          echo "Scanning files for credentials:"
+          echo "$CHANGED" | sed 's/^/  - /'
+          echo "----------------------------------------"
+          echo "$CHANGED" | xargs -d '\n' python ci/scan_secrets.py

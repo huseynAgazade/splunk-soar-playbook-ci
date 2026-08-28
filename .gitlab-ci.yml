@@ -1,0 +1,85 @@
+stages:
+  - validate
+  - scan
+
+# Shared rule anchor: run only on the dev -> main merge request.
+.dev_to_main_rule: &dev_to_main_rule
+  - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME == "dev" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+
+# ---------------------------------------------------------------------------
+# Structure validation: HARD REQUIRED. Cannot be overridden.
+# ---------------------------------------------------------------------------
+validate-playbooks:
+  stage: validate
+  image: python:3.13
+  tags:
+    - soar
+  rules: *dev_to_main_rule
+  variables:
+    GIT_DEPTH: "0"
+    GIT_SSL_NO_VERIFY: "true"
+  script:
+    - python --version
+    - |
+      set -e
+      TARGET_BRANCH="${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
+      echo "Merge request target branch: ${TARGET_BRANCH}"
+      if [ -n "${CI_MERGE_REQUEST_DIFF_BASE_SHA:-}" ]; then
+        BASE="${CI_MERGE_REQUEST_DIFF_BASE_SHA}"
+        echo "Using diff base SHA: ${BASE}"
+      else
+        git fetch --quiet origin "${TARGET_BRANCH}"
+        BASE="origin/${TARGET_BRANCH}"
+        echo "Using diff base ref: ${BASE}"
+      fi
+      CHANGED=$(git diff --name-only --diff-filter=ACMR "${BASE}"...HEAD -- '*.py' '*.json' ':(exclude)ci/**' ':(exclude).gitlab-ci.yml')
+      echo "----------------------------------------"
+      if [ -z "${CHANGED}" ]; then
+        echo "No playbook .py/.json changes in this MR. Nothing to validate."
+        exit 0
+      fi
+      echo "Changed playbook files:"
+      echo "${CHANGED}" | sed 's/^/  - /'
+      echo "----------------------------------------"
+      echo "${CHANGED}" | xargs -d '\n' python ci/validate_playbooks.py
+
+# ---------------------------------------------------------------------------
+# Secret scan (regex + AI): ADVISORY. allow_failure lets an approver merge past
+# it. Human-in-the-loop = required approval + manual merge in project settings.
+# AI failure is a hard error inside the script (exit 2) -> job shows failed.
+# ---------------------------------------------------------------------------
+scan-secrets:
+  stage: scan
+  image: python:3.13
+  tags:
+    - soar
+  rules: *dev_to_main_rule
+  allow_failure: true
+  variables:
+    GIT_DEPTH: "0"
+    GIT_SSL_NO_VERIFY: "true"
+    OLLAMA_MODEL: "gpt-oss:20b"
+    # OLLAMA_URL is provided as a masked CI/CD variable in project settings,
+    # e.g. http://ollama.internal:11434
+  script:
+    - python --version
+    - |
+      set -e
+      TARGET_BRANCH="${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
+      if [ -n "${CI_MERGE_REQUEST_DIFF_BASE_SHA:-}" ]; then
+        BASE="${CI_MERGE_REQUEST_DIFF_BASE_SHA}"
+      else
+        git fetch --quiet origin "${TARGET_BRANCH}"
+        BASE="origin/${TARGET_BRANCH}"
+      fi
+      CHANGED=$(git diff --name-only --diff-filter=ACMR "${BASE}"...HEAD -- '*.py' '*.json' ':(exclude)ci/**' ':(exclude).gitlab-ci.yml')
+      echo "----------------------------------------"
+      if [ -z "${CHANGED}" ]; then
+        echo "No playbook .py/.json changes in this MR. Nothing to scan."
+        exit 0
+      fi
+      echo "Scanning files for credentials:"
+      echo "${CHANGED}" | sed 's/^/  - /'
+      echo "----------------------------------------"
+      echo "${CHANGED}" | xargs -d '\n' python ci/scan_secrets.py
+
